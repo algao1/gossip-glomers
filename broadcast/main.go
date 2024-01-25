@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+	"golang.org/x/exp/maps"
 )
 
 func main() {
@@ -22,15 +23,35 @@ func main() {
 }
 
 type server struct {
-	mu       sync.Mutex
-	node     *maelstrom.Node
-	messages []int
+	mu          sync.Mutex
+	node        *maelstrom.Node
+	neighbours  []string
+	messages    map[int]struct{}
+	toBroadcast chan int
 }
 
 func newServer(n *maelstrom.Node) *server {
-	return &server{
-		node:     n,
-		messages: make([]int, 0),
+	s := server{
+		node:        n,
+		neighbours:  make([]string, 0),
+		messages:    make(map[int]struct{}),
+		toBroadcast: make(chan int, 100),
+	}
+	go s.gossip()
+	return &s
+}
+
+func (s *server) gossip() {
+	for m := range s.toBroadcast {
+		s.mu.Lock()
+		for _, n := range s.neighbours {
+			msg := map[string]any{
+				"type":    "broadcast",
+				"message": float64(m),
+			}
+			s.node.RPC(n, msg, nil)
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -42,12 +63,19 @@ func (s *server) broadcast(msg maelstrom.Message) error {
 
 	resp := make(map[string]any)
 	resp["type"] = "broadcast_ok"
+	m := int(body["message"].(float64))
 
 	s.mu.Lock()
-	s.messages = append(s.messages, int(body["message"].(float64)))
+	if _, ok := s.messages[m]; !ok {
+		s.messages[m] = struct{}{}
+		s.toBroadcast <- m
+	}
 	s.mu.Unlock()
 
-	return s.node.Reply(msg, resp)
+	if _, ok := body["msg_id"]; ok {
+		return s.node.Reply(msg, resp)
+	}
+	return nil
 }
 
 func (s *server) read(msg maelstrom.Message) error {
@@ -60,7 +88,7 @@ func (s *server) read(msg maelstrom.Message) error {
 	resp["type"] = "read_ok"
 
 	s.mu.Lock()
-	resp["messages"] = s.messages
+	resp["messages"] = maps.Keys[map[int]struct{}](s.messages)
 	s.mu.Unlock()
 
 	return s.node.Reply(msg, resp)
@@ -74,6 +102,14 @@ func (s *server) topology(msg maelstrom.Message) error {
 
 	resp := make(map[string]any)
 	resp["type"] = "topology_ok"
+
+	s.mu.Lock()
+	topoRaw := body["topology"].(map[string]any)[s.node.ID()].([]any)
+	s.neighbours = make([]string, len(topoRaw))
+	for i, n := range topoRaw {
+		s.neighbours[i] = n.(string)
+	}
+	s.mu.Unlock()
 
 	return s.node.Reply(msg, resp)
 }
