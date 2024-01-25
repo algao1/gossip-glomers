@@ -2,12 +2,19 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/exp/maps"
 )
+
+func print(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format, args...)
+}
 
 func main() {
 	n := maelstrom.NewNode()
@@ -23,35 +30,51 @@ func main() {
 }
 
 type server struct {
-	mu          sync.Mutex
-	node        *maelstrom.Node
-	neighbours  []string
-	messages    map[int]struct{}
-	toBroadcast chan int
+	mu         sync.Mutex
+	node       *maelstrom.Node
+	neighbours map[string]chan int
+	messages   map[int]struct{}
 }
 
 func newServer(n *maelstrom.Node) *server {
 	s := server{
-		node:        n,
-		neighbours:  make([]string, 0),
-		messages:    make(map[int]struct{}),
-		toBroadcast: make(chan int, 100),
+		node:       n,
+		neighbours: make(map[string]chan int),
+		messages:   make(map[int]struct{}),
 	}
-	go s.gossip()
 	return &s
 }
 
 func (s *server) gossip() {
-	for m := range s.toBroadcast {
-		s.mu.Lock()
-		for _, n := range s.neighbours {
-			msg := map[string]any{
-				"type":    "broadcast",
-				"message": float64(m),
+	for n, nChan := range s.neighbours {
+		go func(n string, nChan chan int) {
+			for m := range nChan {
+				msg := map[string]any{
+					"type":    "broadcast",
+					"message": float64(m),
+				}
+
+				closer := make(chan struct{})
+				go func(m int) {
+					for {
+						select {
+						case <-closer:
+							return
+						case <-time.After(150 * time.Millisecond):
+							nChan <- m
+							return
+						}
+					}
+				}(m)
+
+				s.node.RPC(n, msg, func(respMsg maelstrom.Message) error {
+					if respMsg.Type() == "broadcast_ok" {
+						close(closer)
+					}
+					return nil
+				})
 			}
-			s.node.RPC(n, msg, nil)
-		}
-		s.mu.Unlock()
+		}(n, nChan)
 	}
 }
 
@@ -68,7 +91,9 @@ func (s *server) broadcast(msg maelstrom.Message) error {
 	s.mu.Lock()
 	if _, ok := s.messages[m]; !ok {
 		s.messages[m] = struct{}{}
-		s.toBroadcast <- m
+		for _, nChan := range s.neighbours {
+			nChan <- m
+		}
 	}
 	s.mu.Unlock()
 
@@ -105,10 +130,11 @@ func (s *server) topology(msg maelstrom.Message) error {
 
 	s.mu.Lock()
 	topoRaw := body["topology"].(map[string]any)[s.node.ID()].([]any)
-	s.neighbours = make([]string, len(topoRaw))
-	for i, n := range topoRaw {
-		s.neighbours[i] = n.(string)
+	s.neighbours = make(map[string]chan int)
+	for _, n := range topoRaw {
+		s.neighbours[n.(string)] = make(chan int, 100)
 	}
+	s.gossip()
 	s.mu.Unlock()
 
 	return s.node.Reply(msg, resp)
