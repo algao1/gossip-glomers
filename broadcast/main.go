@@ -50,7 +50,7 @@ func (s *server) gossip() {
 	for n, nChan := range s.neighbours {
 		go func(n string, nChan chan int) {
 			buffer := make([]int, 0)
-			ticker := time.NewTicker(time.Duration(100) * time.Millisecond)
+			ticker := time.NewTicker(time.Duration(150) * time.Millisecond)
 
 			for {
 				select {
