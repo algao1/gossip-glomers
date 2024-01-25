@@ -21,6 +21,7 @@ func main() {
 	s := newServer(n)
 
 	n.Handle("broadcast", s.broadcast)
+	n.Handle("batch_broadcast", s.batchBroadcast)
 	n.Handle("read", s.read)
 	n.Handle("topology", s.topology)
 
@@ -48,31 +49,49 @@ func newServer(n *maelstrom.Node) *server {
 func (s *server) gossip() {
 	for n, nChan := range s.neighbours {
 		go func(n string, nChan chan int) {
-			for m := range nChan {
-				msg := map[string]any{
-					"type":    "broadcast",
-					"message": float64(m),
-				}
+			buffer := make([]int, 0)
+			ticker := time.NewTicker(time.Duration(100) * time.Millisecond)
 
-				closer := make(chan struct{})
-				go func(m int) {
-					for {
-						select {
-						case <-closer:
-							return
-						case <-time.After(150 * time.Millisecond):
-							nChan <- m
-							return
+			for {
+				select {
+				case <-ticker.C:
+					l := len(buffer)
+					batch := buffer[:l]
+					buffer = buffer[l:]
+
+					if len(batch) == 0 {
+						continue
+					}
+
+					msg := map[string]any{
+						"type":            "batch_broadcast",
+						"batched_message": batch,
+					}
+
+					closer := make(chan struct{})
+					go func(batch []int) {
+						for {
+							select {
+							case <-closer:
+								return
+							case <-time.After(250 * time.Millisecond):
+								for _, m := range batch {
+									nChan <- m
+								}
+								return
+							}
 						}
-					}
-				}(m)
+					}(batch)
 
-				s.node.RPC(n, msg, func(respMsg maelstrom.Message) error {
-					if respMsg.Type() == "broadcast_ok" {
-						close(closer)
-					}
-					return nil
-				})
+					s.node.RPC(n, msg, func(respMsg maelstrom.Message) error {
+						if respMsg.Type() == "batch_broadcast_ok" {
+							close(closer)
+						}
+						return nil
+					})
+				case m := <-nChan:
+					buffer = append(buffer, m)
+				}
 			}
 		}(n, nChan)
 	}
@@ -90,10 +109,38 @@ func (s *server) broadcast(msg maelstrom.Message) error {
 
 	s.mu.Lock()
 	if _, ok := s.messages[m]; !ok {
-		s.messages[m] = struct{}{}
 		for _, nChan := range s.neighbours {
 			nChan <- m
 		}
+	}
+	s.messages[m] = struct{}{}
+	s.mu.Unlock()
+
+	if _, ok := body["msg_id"]; ok {
+		return s.node.Reply(msg, resp)
+	}
+	return nil
+}
+
+func (s *server) batchBroadcast(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	resp := make(map[string]any)
+	resp["type"] = "batch_broadcast_ok"
+	batch := body["batched_message"].([]any)
+
+	s.mu.Lock()
+	for _, bm := range batch {
+		m := int(bm.(float64))
+		if _, ok := s.messages[m]; !ok {
+			for _, nChan := range s.neighbours {
+				nChan <- m
+			}
+		}
+		s.messages[m] = struct{}{}
 	}
 	s.mu.Unlock()
 
@@ -132,7 +179,7 @@ func (s *server) topology(msg maelstrom.Message) error {
 	topoRaw := body["topology"].(map[string]any)[s.node.ID()].([]any)
 	s.neighbours = make(map[string]chan int)
 	for _, n := range topoRaw {
-		s.neighbours[n.(string)] = make(chan int, 100)
+		s.neighbours[n.(string)] = make(chan int, 1000)
 	}
 	s.gossip()
 	s.mu.Unlock()
