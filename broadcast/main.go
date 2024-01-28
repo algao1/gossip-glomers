@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -68,27 +69,17 @@ func (s *server) gossip() {
 						"batched_message": batch,
 					}
 
-					closer := make(chan struct{})
 					go func(batch []int) {
-						for {
-							select {
-							case <-closer:
-								return
-							case <-time.After(250 * time.Millisecond):
-								for _, m := range batch {
-									nChan <- m
-								}
-								return
+						ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+						defer cancel()
+						_, err := s.node.SyncRPC(ctx, n, msg)
+						if err != nil {
+							for _, m := range batch {
+								nChan <- m
 							}
+							return
 						}
 					}(batch)
-
-					s.node.RPC(n, msg, func(respMsg maelstrom.Message) error {
-						if respMsg.Type() == "batch_broadcast_ok" {
-							close(closer)
-						}
-						return nil
-					})
 				case m := <-nChan:
 					buffer = append(buffer, m)
 				}
