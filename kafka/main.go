@@ -7,6 +7,7 @@ import (
 	"log"
 	"slices"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -36,7 +37,8 @@ type server struct {
 }
 
 type partition struct {
-	log []logMessage
+	log             []logMessage
+	persistedOffset int
 }
 
 type logMessage struct {
@@ -51,6 +53,7 @@ func newServer(node *maelstrom.Node, skv, lkv *maelstrom.KV) *server {
 		lkv:        lkv,
 		partitions: make(map[string]*partition),
 	}
+	go s.update()
 	return &s
 }
 
@@ -62,6 +65,20 @@ func (s *server) getOwner(key string) string {
 		i *= -1
 	}
 	return s.node.NodeIDs()[i%len(s.node.NodeIDs())]
+}
+
+func (s *server) update() {
+	for range time.NewTicker(2500 * time.Millisecond).C {
+		s.mu.Lock()
+		for k, partition := range s.partitions {
+			if partition.persistedOffset == len(partition.log) {
+				continue
+			}
+			s.lkv.Write(context.Background(), k, partition.log)
+			partition.persistedOffset = len(partition.log)
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *server) send(msg maelstrom.Message) error {
@@ -88,7 +105,6 @@ func (s *server) send(msg maelstrom.Message) error {
 			Offset:  logLen,
 			Message: msgInt,
 		})
-		s.lkv.Write(context.Background(), key, s.partitions[key].log)
 		resp["offset"] = logLen
 		s.mu.Unlock()
 	} else {
@@ -136,7 +152,6 @@ func (s *server) poll(msg maelstrom.Message) error {
 			}
 
 			logT := make([][]int, 0)
-
 			for i := len(log) - 1; i >= 0; i-- {
 				if log[i].Offset < int(v.(float64)) {
 					break
