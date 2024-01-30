@@ -38,6 +38,7 @@ type server struct {
 
 type partition struct {
 	log             []logMessage
+	committedOffset int
 	persistedOffset int
 }
 
@@ -68,14 +69,18 @@ func (s *server) getOwner(key string) string {
 }
 
 func (s *server) update() {
-	for range time.NewTicker(2500 * time.Millisecond).C {
+	for {
+		time.Sleep(2000 * time.Millisecond)
 		s.mu.Lock()
 		for k, partition := range s.partitions {
-			if partition.persistedOffset == len(partition.log) {
+			if s.getOwner(k) != s.node.ID() {
 				continue
 			}
-			s.lkv.Write(context.Background(), k, partition.log)
-			partition.persistedOffset = len(partition.log)
+			if partition.persistedOffset != len(partition.log) {
+				s.lkv.Write(context.Background(), k, partition.log)
+				partition.persistedOffset = len(partition.log)
+			}
+			s.skv.Write(context.Background(), k, s.partitions[k].committedOffset)
 		}
 		s.mu.Unlock()
 	}
@@ -183,21 +188,53 @@ func (s *server) commitOffsets(msg maelstrom.Message) error {
 
 	rawOffsets := body["offsets"].(map[string]any)
 
+	passOffsets := make(map[string]map[string]int)
+
 	for k, v := range rawOffsets {
 		offset := int(v.(float64))
-		for {
-			oldOffset, err := s.skv.ReadInt(context.Background(), k)
-			if err != nil {
-				oldOffset = 0
+		owner := s.getOwner(k)
+		if owner == s.node.ID() {
+			s.mu.Lock()
+			if _, ok := s.partitions[k]; !ok {
+				s.partitions[k] = &partition{log: make([]logMessage, 0)}
 			}
-			if oldOffset > offset {
-				break
+			if offset > s.partitions[k].committedOffset {
+				s.partitions[k].committedOffset = offset
 			}
+			s.mu.Unlock()
+		} else {
+			if _, ok := passOffsets[owner]; !ok {
+				passOffsets[owner] = make(map[string]int)
+			}
+			passOffsets[owner][k] = offset
+		}
 
-			err = s.skv.CompareAndSwap(context.Background(), k, oldOffset, offset, true)
-			if err == nil {
-				break
-			}
+		// for {
+		// 	oldOffset, err := s.skv.ReadInt(context.Background(), k)
+		// 	if err != nil {
+		// 		oldOffset = 0
+		// 	}
+		// 	if oldOffset > offset {
+		// 		break
+		// 	}
+
+		// 	err = s.skv.CompareAndSwap(context.Background(), k, oldOffset, offset, true)
+		// 	if err == nil {
+		// 		break
+		// 	}
+		// }
+	}
+
+	for owner, offsets := range passOffsets {
+		relayedMsg, err := s.node.SyncRPC(context.Background(), owner, map[string]any{
+			"type":    "commit_offsets",
+			"offsets": offsets,
+		})
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(relayedMsg.Body, &body); err != nil {
+			return err
 		}
 	}
 
@@ -218,10 +255,23 @@ func (s *server) listCommittedOffsets(msg maelstrom.Message) error {
 	rawKeys := body["keys"].([]any)
 	for _, v := range rawKeys {
 		key := v.(string)
-		offset, err := s.skv.ReadInt(context.Background(), key)
-		if err != nil {
-			offset = 0
+		owner := s.getOwner(key)
+		var offset int
+
+		if owner == s.node.ID() {
+			s.mu.Lock()
+			if _, ok := s.partitions[key]; ok {
+				offset = s.partitions[key].committedOffset
+			}
+			s.mu.Unlock()
+		} else {
+			var err error
+			offset, err = s.skv.ReadInt(context.Background(), key)
+			if err != nil {
+				offset = 0
+			}
 		}
+
 		ret[key] = offset
 	}
 
